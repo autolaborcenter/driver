@@ -6,15 +6,17 @@ use std::{
 
 pub mod default;
 
-pub trait Driver<T, S: DriverStatus>:
-    'static + Send + Iterator<Item = (Instant, S::Event)>
-{
+pub trait Driver<T>: 'static + Send {
     type Pacemaker: DriverPacemaker;
-    type Handle: DriverHandle;
+    type Status: DriverStatus;
+    type Command;
 
     fn new(t: T) -> (Self::Pacemaker, Self);
-    fn handle(&self) -> Self::Handle;
-    fn status(&self) -> S;
+    fn status(&self) -> Self::Status;
+    fn send(&mut self, command: Self::Command);
+    fn wait<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut Self, Instant, <Self::Status as DriverStatus>::Event);
 }
 
 pub trait DriverStatus: 'static + Clone {
@@ -23,22 +25,12 @@ pub trait DriverStatus: 'static + Clone {
     fn update(&mut self, event: Self::Event);
 }
 
-pub trait DriverHandle: 'static + Clone {
-    type Command;
-
-    fn send(&self, command: Self::Command) -> bool;
-}
-
-pub trait DriverPacemaker: 'static + Send + Sized {
+pub trait DriverPacemaker: 'static + Send {
     fn period() -> Duration;
     fn send(&mut self) -> bool;
 }
 
-pub trait Module<T, S, D>
-where
-    S: DriverStatus,
-    D: Driver<T, S>,
-{
+pub trait Module<T, D: Driver<T>> {
     fn keys() -> Vec<T>;
 
     fn open_all(len: usize) -> Vec<Box<D>> {
@@ -76,7 +68,7 @@ where
                 .map(|mut o| {
                     let counter = counter.clone();
                     thread::spawn(move || loop {
-                        if let Some(_) = o.next() {
+                        if o.wait(|_, _, _| {}) {
                             if Arc::strong_count(&counter) <= len {
                                 return Some(o);
                             }
