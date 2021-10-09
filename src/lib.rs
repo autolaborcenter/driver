@@ -13,10 +13,10 @@ pub trait Driver<T>: 'static + Send {
 
     fn new(t: T) -> (Self::Pacemaker, Self);
     fn status(&self) -> Self::Status;
-    fn send(&mut self, command: Self::Command);
-    fn wait<F>(&mut self, f: F) -> bool
+    fn send(&mut self, command: (Instant, Self::Command));
+    fn join<F>(&mut self, f: F) -> bool
     where
-        F: FnOnce(&mut Self, Instant, <Self::Status as DriverStatus>::Event);
+        F: FnMut(&mut Self, Option<(Instant, <Self::Status as DriverStatus>::Event)>) -> bool;
 }
 
 pub trait DriverStatus: 'static + Clone {
@@ -67,13 +67,11 @@ pub trait Module<T, D: Driver<T>> {
                 .into_iter()
                 .map(|mut o| {
                     let counter = counter.clone();
-                    thread::spawn(move || loop {
-                        if o.wait(|_, _, _| {}) {
-                            if Arc::strong_count(&counter) <= len {
-                                return Some(o);
-                            }
+                    thread::spawn(move || {
+                        if o.join(|_, _| Arc::strong_count(&counter) > len) {
+                            Some(o)
                         } else {
-                            return None;
+                            None
                         }
                     })
                 })
