@@ -1,6 +1,8 @@
 use std::{
-    sync::Arc,
-    thread,
+    collections::HashMap,
+    hash::Hash,
+    sync::{atomic::AtomicBool, mpsc::*, Arc},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -16,24 +18,24 @@ pub trait Driver<T>: 'static + Send + Sized {
     type Status: DriverStatus;
     type Command;
 
-    fn new(t: T) -> Option<(Self::Pacemaker, Self)>;
+    fn new(t: &T) -> Option<(Self::Pacemaker, Self)>;
     fn status<'a>(&'a self) -> &'a Self::Status;
     fn send(&mut self, command: (Instant, Self::Command));
     fn join<F>(&mut self, f: F) -> bool
     where
         F: FnMut(&mut Self, Option<(Instant, <Self::Status as DriverStatus>::Event)>) -> bool;
 
-    fn open_all<I>(keys: I, len: usize) -> Vec<Box<Self>>
+    fn open_all<I>(keys: I, len: usize, timeout: Duration) -> Vec<(T, Box<Self>)>
     where
         I: IntoIterator<Item = T>,
     {
-        let mut pacemakers = Vec::<Box<Self::Pacemaker>>::new();
-        let mut drivers = Vec::<Box<Self>>::new();
+        let mut pacemakers = Vec::new();
+        let mut drivers = Vec::new();
         keys.into_iter()
-            .filter_map(|t| Self::new(t))
-            .for_each(|(p, d)| {
+            .filter_map(|t| Self::new(&t).map(|pair| (t, pair)))
+            .for_each(|(t, (p, d))| {
                 pacemakers.push(Box::new(p));
-                drivers.push(Box::new(d));
+                drivers.push((t, Box::new(d)));
             });
 
         thread::spawn(move || {
@@ -54,23 +56,29 @@ pub trait Driver<T>: 'static + Send + Sized {
         });
 
         {
+            let deadline = Instant::now() + timeout;
             let counter = Arc::new(());
             drivers
                 .into_iter()
-                .map(|mut o| {
+                .map(|(t, mut o)| {
                     let counter = counter.clone();
-                    thread::spawn(move || {
-                        if o.join(|_, _| Arc::strong_count(&counter) > len) {
-                            Some(o)
-                        } else {
-                            None
-                        }
-                    })
+                    (
+                        t,
+                        thread::spawn(move || {
+                            if o.join(|_, _| {
+                                Arc::strong_count(&counter) > len && Instant::now() < deadline
+                            }) {
+                                Some(o)
+                            } else {
+                                None
+                            }
+                        }),
+                    )
                 })
                 .collect::<Vec<_>>()
         }
         .into_iter()
-        .filter_map(|o| o.join().ok().flatten())
+        .filter_map(|(t, o)| o.join().ok().flatten().map(|b| (t, b)))
         .collect()
     }
 }
@@ -79,7 +87,7 @@ pub trait Driver<T>: 'static + Send + Sized {
 ///
 /// 也可以通过累积事件来跟踪状态。
 pub trait DriverStatus: 'static {
-    type Event;
+    type Event: Send;
 
     fn update(&mut self, event: Self::Event);
 }
@@ -104,7 +112,7 @@ impl DriverPacemaker for () {
 }
 
 pub enum SupersivorEventForSingle<'a, T, D: Driver<T>> {
-    Connected(&'a mut D),
+    Connected(T, &'a mut D),
     ConnectFailed,
     Event(
         &'a mut D,
@@ -115,6 +123,7 @@ pub enum SupersivorEventForSingle<'a, T, D: Driver<T>> {
 
 pub trait SupervisorForSingle<T, D: Driver<T>> {
     fn context<'a>(&'a mut self) -> &'a mut Box<Option<D>>;
+    fn open_timeout() -> Duration;
     fn keys() -> Vec<T>;
 
     fn join<F>(&mut self, mut f: F)
@@ -136,11 +145,14 @@ pub trait SupervisorForSingle<T, D: Driver<T>> {
                         break;
                     }
                 },
-                None => match D::open_all(Self::keys(), 1).into_iter().next() {
+                None => match D::open_all(Self::keys(), 1, Self::open_timeout())
+                    .into_iter()
+                    .next()
+                {
                     // 上下文为空，重试
-                    Some(mut driver) => {
+                    Some((t, mut driver)) => {
                         // 成功打开驱动
-                        if !f(Connected(&mut *driver)) {
+                        if !f(Connected(t, &mut *driver)) {
                             return;
                         } else {
                             *self.context() = Box::new(Some(*driver));
@@ -159,6 +171,96 @@ pub trait SupervisorForSingle<T, D: Driver<T>> {
     }
 }
 
+pub enum SupersivorEventForMultiple<'a, T, D>
+where
+    T: Clone + Hash,
+    D: Driver<T>,
+{
+    Connected(T, &'a mut D),
+    ConnectFailed {
+        current: usize,
+        target: usize,
+        begining: Instant,
+    },
+    Event(T, Option<(Instant, <D::Status as DriverStatus>::Event)>),
+    Disconnected(T),
+}
+
+pub trait SupervisorForMultiple<T, D>
+where
+    T: 'static + Send + Clone + Eq + Hash,
+    D: Driver<T>,
+{
+    fn context<'a>(&'a mut self) -> &'a mut HashMap<T, Box<D>>;
+    fn open_timeout() -> Duration;
+    fn keys() -> Vec<T>;
+
+    fn join<F>(&mut self, len: usize, mut f: F)
+    where
+        F: FnMut(SupersivorEventForMultiple<T, D>) -> bool,
+    {
+        use SupersivorEventForMultiple::*;
+
+        let (sender, receiver) = sync_channel(2 * len);
+        let running = Arc::new(AtomicBool::new(true));
+        let context = std::mem::replace(self.context(), HashMap::new());
+        let mut handles = context
+            .into_iter()
+            .map(|(t, d)| (t.clone(), spawn(sender.clone(), running.clone(), t, d)))
+            .collect::<HashMap<_, _>>();
+
+        let mut _loop = true;
+        while _loop {
+            let begining = Instant::now();
+            while handles.len() < len {
+                let new = D::open_all(Self::keys(), len - handles.len(), Self::open_timeout());
+                if new.is_empty() {
+                    if !f(ConnectFailed {
+                        current: handles.len(),
+                        target: len,
+                        begining,
+                    }) {
+                        _loop = false;
+                        break;
+                    }
+                } else {
+                    for (t, mut d) in new.into_iter() {
+                        if _loop && !f(Connected(t.clone(), &mut d)) {
+                            _loop = false;
+                        }
+                        handles.insert(t.clone(), spawn(sender.clone(), running.clone(), t, d));
+                    }
+                }
+            }
+            if _loop {
+                for event in &receiver {
+                    match event {
+                        OutEvent::Event(which, what) => {
+                            if !f(Event(which, what)) {
+                                _loop = false;
+                                break;
+                            }
+                        }
+                        OutEvent::Disconnected(which) => {
+                            handles.remove(&which);
+                            if !f(Disconnected(which)) {
+                                _loop = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        running.store(false, std::sync::atomic::Ordering::Release);
+        self.context().extend(
+            handles
+                .into_iter()
+                .filter_map(|(_, handle)| handle.join().ok().flatten()),
+        );
+    }
+}
+
 struct Timer(Instant);
 
 impl Timer {
@@ -169,4 +271,32 @@ impl Timer {
         }
         thread::sleep(self.0 - now);
     }
+}
+
+enum OutEvent<T, D: Driver<T>> {
+    Event(T, Option<(Instant, <D::Status as DriverStatus>::Event)>),
+    Disconnected(T),
+}
+
+fn spawn<T, D>(
+    sender: SyncSender<OutEvent<T, D>>,
+    running: Arc<AtomicBool>,
+    t: T,
+    mut d: Box<D>,
+) -> JoinHandle<Option<(T, Box<D>)>>
+where
+    T: 'static + Send + Clone,
+    D: Driver<T>,
+{
+    thread::spawn(move || {
+        if d.join(|_, event| {
+            let _ = sender.send(OutEvent::Event(t.clone(), event));
+            running.load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            Some((t, d))
+        } else {
+            let _ = sender.send(OutEvent::Disconnected(t));
+            None
+        }
+    })
 }
