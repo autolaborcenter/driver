@@ -17,7 +17,7 @@ pub trait Driver<T>: 'static + Send + Sized {
     type Command;
 
     fn new(t: T) -> Option<(Self::Pacemaker, Self)>;
-    fn status(&self) -> Self::Status;
+    fn status<'a>(&'a self) -> &'a Self::Status;
     fn send(&mut self, command: (Instant, Self::Command));
     fn join<F>(&mut self, f: F) -> bool
     where
@@ -78,7 +78,7 @@ pub trait Driver<T>: 'static + Send + Sized {
 /// 状态的增量是事件。
 ///
 /// 也可以通过累积事件来跟踪状态。
-pub trait DriverStatus: 'static + Clone {
+pub trait DriverStatus: 'static {
     type Event;
 
     fn update(&mut self, event: Self::Event);
