@@ -1,10 +1,14 @@
 use std::{
-    collections::HashMap,
     hash::Hash,
-    sync::{atomic::AtomicBool, mpsc::*, Arc},
-    thread::{self, JoinHandle},
+    marker::PhantomData,
+    sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
+
+mod supervisor_multiple;
+
+use supervisor_multiple::JoinContextForMultiple;
 
 /// 实现驱动特性，需要指定其对应的起搏器类型、状态类型和指令类型。
 ///
@@ -17,6 +21,9 @@ pub trait Driver<T>: 'static + Send + Sized {
     type Pacemaker: DriverPacemaker;
     type Status: DriverStatus;
     type Command;
+
+    fn keys() -> Vec<T>;
+    fn open_timeout() -> Duration;
 
     fn new(t: &T) -> Option<(Self::Pacemaker, Self)>;
     fn status<'a>(&'a self) -> &'a Self::Status;
@@ -111,6 +118,8 @@ impl DriverPacemaker for () {
     }
 }
 
+pub struct SupervisorForSingle<T, D: Driver<T>>(Box<Option<D>>, PhantomData<T>);
+
 pub enum SupersivorEventForSingle<'a, T, D: Driver<T>> {
     Connected(T, &'a mut D),
     ConnectFailed,
@@ -121,19 +130,19 @@ pub enum SupersivorEventForSingle<'a, T, D: Driver<T>> {
     Disconnected,
 }
 
-pub trait SupervisorForSingle<T, D: Driver<T>> {
-    fn context<'a>(&'a mut self) -> &'a mut Box<Option<D>>;
-    fn open_timeout() -> Duration;
-    fn keys() -> Vec<T>;
+impl<T, D: Driver<T>> SupervisorForSingle<T, D> {
+    pub fn new() -> Self {
+        Self(Box::new(None), PhantomData)
+    }
 
-    fn join<F>(&mut self, mut f: F)
+    pub fn join<F>(&mut self, mut f: F)
     where
         F: FnMut(SupersivorEventForSingle<T, D>) -> bool,
     {
         loop {
             use SupersivorEventForSingle::*;
 
-            match self.context().as_mut() {
+            match self.0.as_mut() {
                 Some(ref mut driver) => loop {
                     // 上下文中保存了驱动
                     if driver.join(|d, e| f(Event(d, e))) || !f(Disconnected) {
@@ -141,11 +150,11 @@ pub trait SupervisorForSingle<T, D: Driver<T>> {
                         return;
                     } else {
                         // 清除上下文，重试
-                        *self.context() = Box::new(None);
+                        self.0 = Box::new(None);
                         break;
                     }
                 },
-                None => match D::open_all(Self::keys(), 1, Self::open_timeout())
+                None => match D::open_all(D::keys(), 1, D::open_timeout())
                     .into_iter()
                     .next()
                 {
@@ -155,7 +164,7 @@ pub trait SupervisorForSingle<T, D: Driver<T>> {
                         if !f(Connected(t, &mut *driver)) {
                             return;
                         } else {
-                            *self.context() = Box::new(Some(*driver));
+                            self.0 = Box::new(Some(*driver));
                             continue;
                         }
                     }
@@ -171,12 +180,17 @@ pub trait SupervisorForSingle<T, D: Driver<T>> {
     }
 }
 
-pub enum SupersivorEventForMultiple<'a, T, D>
+pub struct SupervisorForMultiple<K, D>(Vec<(K, Box<D>)>, PhantomData<K>)
 where
-    T: Clone + Hash,
+    K: 'static + Send + Clone + Eq + Hash,
+    D: Driver<K>;
+
+pub enum SupervisorEventForMultiple<'a, T, D>
+where
+    T: Clone,
     D: Driver<T>,
 {
-    Connected(T, &'a mut D),
+    Connected(&'a T, &'a mut D),
     ConnectFailed {
         current: usize,
         target: usize,
@@ -186,78 +200,20 @@ where
     Disconnected(T),
 }
 
-pub trait SupervisorForMultiple<T, D>
+impl<K, D> SupervisorForMultiple<K, D>
 where
-    T: 'static + Send + Clone + Eq + Hash,
-    D: Driver<T>,
+    K: 'static + Send + Clone + Eq + Hash,
+    D: Driver<K>,
 {
-    fn context<'a>(&'a mut self) -> &'a mut HashMap<T, Box<D>>;
-    fn open_timeout() -> Duration;
-    fn keys() -> Vec<T>;
+    pub fn new() -> Self {
+        Self(Vec::new(), PhantomData)
+    }
 
-    fn join<F>(&mut self, len: usize, mut f: F)
+    pub fn join<F>(&mut self, len: usize, f: F)
     where
-        F: FnMut(SupersivorEventForMultiple<T, D>) -> bool,
+        F: FnMut(SupervisorEventForMultiple<K, D>) -> bool,
     {
-        use SupersivorEventForMultiple::*;
-
-        let (sender, receiver) = sync_channel(2 * len);
-        let running = Arc::new(AtomicBool::new(true));
-        let context = std::mem::replace(self.context(), HashMap::new());
-        let mut handles = context
-            .into_iter()
-            .map(|(t, d)| (t.clone(), spawn(sender.clone(), running.clone(), t, d)))
-            .collect::<HashMap<_, _>>();
-
-        let mut _loop = true;
-        while _loop {
-            let begining = Instant::now();
-            while handles.len() < len {
-                let new = D::open_all(Self::keys(), len - handles.len(), Self::open_timeout());
-                if new.is_empty() {
-                    if !f(ConnectFailed {
-                        current: handles.len(),
-                        target: len,
-                        begining,
-                    }) {
-                        _loop = false;
-                        break;
-                    }
-                } else {
-                    for (t, mut d) in new.into_iter() {
-                        if _loop && !f(Connected(t.clone(), &mut d)) {
-                            _loop = false;
-                        }
-                        handles.insert(t.clone(), spawn(sender.clone(), running.clone(), t, d));
-                    }
-                }
-            }
-            if _loop {
-                for event in &receiver {
-                    match event {
-                        OutEvent::Event(which, what) => {
-                            if !f(Event(which, what)) {
-                                _loop = false;
-                                break;
-                            }
-                        }
-                        OutEvent::Disconnected(which) => {
-                            handles.remove(&which);
-                            if !f(Disconnected(which)) {
-                                _loop = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        running.store(false, std::sync::atomic::Ordering::Release);
-        self.context().extend(
-            handles
-                .into_iter()
-                .filter_map(|(_, handle)| handle.join().ok().flatten()),
-        );
+        JoinContextForMultiple::new(self, len, f).run();
     }
 }
 
@@ -271,32 +227,4 @@ impl Timer {
         }
         thread::sleep(self.0 - now);
     }
-}
-
-enum OutEvent<T, D: Driver<T>> {
-    Event(T, Option<(Instant, <D::Status as DriverStatus>::Event)>),
-    Disconnected(T),
-}
-
-fn spawn<T, D>(
-    sender: SyncSender<OutEvent<T, D>>,
-    running: Arc<AtomicBool>,
-    t: T,
-    mut d: Box<D>,
-) -> JoinHandle<Option<(T, Box<D>)>>
-where
-    T: 'static + Send + Clone,
-    D: Driver<T>,
-{
-    thread::spawn(move || {
-        if d.join(|_, event| {
-            let _ = sender.send(OutEvent::Event(t.clone(), event));
-            running.load(std::sync::atomic::Ordering::Acquire)
-        }) {
-            Some((t, d))
-        } else {
-            let _ = sender.send(OutEvent::Disconnected(t));
-            None
-        }
-    })
 }
