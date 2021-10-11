@@ -1,6 +1,5 @@
 use std::{
     hash::Hash,
-    marker::PhantomData,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -17,24 +16,24 @@ use supervisor_multiple::JoinContextForMultiple;
 /// 可以从驱动中读取状态，或向驱动发送指令。
 ///
 /// 监听驱动事件是独占且阻塞的，但在传入的回调中可以修改驱动状态。
-pub trait Driver<T>: 'static + Send + Sized {
-    type Pacemaker: DriverPacemaker;
-    type Status: DriverStatus;
+pub trait Driver: 'static + Send + Sized {
+    type Key;
+    type Pacemaker: DriverPacemaker + Send;
+    type Event;
     type Command;
 
-    fn keys() -> Vec<T>;
+    fn keys() -> Vec<Self::Key>;
     fn open_timeout() -> Duration;
 
-    fn new(t: &T) -> Option<(Self::Pacemaker, Self)>;
-    fn status<'a>(&'a self) -> &'a Self::Status;
+    fn new(t: &Self::Key) -> Option<(Self::Pacemaker, Self)>;
     fn send(&mut self, command: (Instant, Self::Command));
     fn join<F>(&mut self, f: F) -> bool
     where
-        F: FnMut(&mut Self, Option<(Instant, <Self::Status as DriverStatus>::Event)>) -> bool;
+        F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
 
-    fn open_all<I>(keys: I, len: usize, timeout: Duration) -> Vec<(T, Box<Self>)>
+    fn open_all<I>(keys: I, len: usize, timeout: Duration) -> Vec<(Self::Key, Box<Self>)>
     where
-        I: IntoIterator<Item = T>,
+        I: IntoIterator<Item = Self::Key>,
     {
         let mut pacemakers = Vec::new();
         let mut drivers = Vec::new();
@@ -90,19 +89,10 @@ pub trait Driver<T>: 'static + Send + Sized {
     }
 }
 
-/// 状态的增量是事件。
-///
-/// 也可以通过累积事件来跟踪状态。
-pub trait DriverStatus: 'static {
-    type Event: Send;
-
-    fn update(&mut self, event: Self::Event);
-}
-
 /// 起搏器有一个静态不变的周期。
 ///
 /// 应该根据这个周期定时发送触发脉冲。
-pub trait DriverPacemaker: 'static + Send {
+pub trait DriverPacemaker {
     fn period() -> Duration;
     fn send(&mut self) -> bool;
 }
@@ -118,26 +108,23 @@ impl DriverPacemaker for () {
     }
 }
 
-pub struct SupervisorForSingle<T, D: Driver<T>>(Box<Option<D>>, PhantomData<T>);
+pub struct SupervisorForSingle<D: Driver>(Box<Option<D>>);
 
-pub enum SupersivorEventForSingle<'a, T, D: Driver<T>> {
-    Connected(T, &'a mut D),
+pub enum SupersivorEventForSingle<'a, D: Driver> {
+    Connected(<D as Driver>::Key, &'a mut D),
     ConnectFailed,
-    Event(
-        &'a mut D,
-        Option<(Instant, <D::Status as DriverStatus>::Event)>,
-    ),
+    Event(&'a mut D, Option<(Instant, D::Event)>),
     Disconnected,
 }
 
-impl<T, D: Driver<T>> SupervisorForSingle<T, D> {
+impl<D: Driver> SupervisorForSingle<D> {
     pub fn new() -> Self {
-        Self(Box::new(None), PhantomData)
+        Self(Box::new(None))
     }
 
     pub fn join<F>(&mut self, mut f: F)
     where
-        F: FnMut(SupersivorEventForSingle<T, D>) -> bool,
+        F: FnMut(SupersivorEventForSingle<D>) -> bool,
     {
         loop {
             use SupersivorEventForSingle::*;
@@ -180,38 +167,31 @@ impl<T, D: Driver<T>> SupervisorForSingle<T, D> {
     }
 }
 
-pub struct SupervisorForMultiple<K, D>(Vec<(K, Box<D>)>, PhantomData<K>)
-where
-    K: 'static + Send + Clone + Eq + Hash,
-    D: Driver<K>;
+pub struct SupervisorForMultiple<D: Driver>(Vec<(D::Key, Box<D>)>);
 
-pub enum SupervisorEventForMultiple<'a, T, D>
-where
-    T: Clone,
-    D: Driver<T>,
-{
-    Connected(&'a T, &'a mut D),
+pub enum SupervisorEventForMultiple<'a, D: Driver> {
+    Connected(&'a D::Key, &'a mut D),
     ConnectFailed {
         current: usize,
         target: usize,
         begining: Instant,
     },
-    Event(T, Option<(Instant, <D::Status as DriverStatus>::Event)>),
-    Disconnected(T),
+    Event(D::Key, Option<(Instant, D::Event)>),
+    Disconnected(D::Key),
 }
 
-impl<K, D> SupervisorForMultiple<K, D>
+impl<D: Driver> SupervisorForMultiple<D>
 where
-    K: 'static + Send + Clone + Eq + Hash,
-    D: Driver<K>,
+    D::Key: Send + Clone + Eq + Hash,
+    D::Event: Send,
 {
     pub fn new() -> Self {
-        Self(Vec::new(), PhantomData)
+        Self(Vec::new())
     }
 
     pub fn join<F>(&mut self, len: usize, f: F)
     where
-        F: FnMut(SupervisorEventForMultiple<K, D>) -> bool,
+        F: FnMut(SupervisorEventForMultiple<D>) -> bool,
     {
         JoinContextForMultiple::new(self, len, f).run();
     }

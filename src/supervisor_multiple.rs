@@ -1,4 +1,4 @@
-﻿use super::{Driver, DriverStatus, SupervisorEventForMultiple, SupervisorForMultiple};
+﻿use super::{Driver, SupervisorEventForMultiple, SupervisorForMultiple};
 use std::{
     collections::HashMap,
     hash::Hash,
@@ -7,27 +7,23 @@ use std::{
     time::Instant,
 };
 
-pub(super) struct JoinContextForMultiple<'a, K, D, F>
-where
-    K: 'static + Send + Clone + Eq + Hash,
-    D: Driver<K>,
-    F: FnMut(SupervisorEventForMultiple<K, D>) -> bool,
-{
-    parent: &'a mut SupervisorForMultiple<K, D>,
-    handles: HashMap<K, JoinHandle<Option<(K, Box<D>)>>>,
-    sender: SyncSender<OutEvent<K, D>>,
-    receiver: Receiver<OutEvent<K, D>>,
+pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
+    parent: &'a mut SupervisorForMultiple<D>,
+    handles: HashMap<<D as Driver>::Key, JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>>,
+    sender: SyncSender<OutEvent<D>>,
+    receiver: Receiver<OutEvent<D>>,
     len: usize,
     f: F,
 }
 
-impl<'a, K, D, F> JoinContextForMultiple<'a, K, D, F>
+impl<'a, D, F> JoinContextForMultiple<'a, D, F>
 where
-    K: 'static + Send + Clone + Eq + Hash,
-    D: Driver<K>,
-    F: FnMut(SupervisorEventForMultiple<K, D>) -> bool,
+    D: Driver,
+    D::Key: Send + Clone + Eq + Hash,
+    D::Event: Send,
+    F: FnMut(SupervisorEventForMultiple<D>) -> bool,
 {
-    pub fn new(parent: &'a mut SupervisorForMultiple<K, D>, len: usize, f: F) -> Self {
+    pub fn new(parent: &'a mut SupervisorForMultiple<D>, len: usize, f: F) -> Self {
         let (sender, receiver) = sync_channel(2 * len);
 
         // 取出上下文中保存的驱动对象
@@ -46,10 +42,7 @@ where
         }
     }
 
-    pub fn run(mut self)
-    where
-        F: FnMut(SupervisorEventForMultiple<K, D>) -> bool,
-    {
+    pub fn run(mut self) {
         use SupervisorEventForMultiple::*;
 
         // 尽量接收驱动的消息
@@ -133,19 +126,19 @@ where
     }
 }
 
-enum OutEvent<T, D: Driver<T>> {
-    Event(T, Option<(Instant, <D::Status as DriverStatus>::Event)>),
-    Disconnected(T),
+enum OutEvent<D: Driver> {
+    Event(D::Key, Option<(Instant, D::Event)>),
+    Disconnected(D::Key),
 }
 
-fn spawn<K, D>(
-    sender: SyncSender<OutEvent<K, D>>,
-    k: K,
+fn spawn<D: Driver>(
+    sender: SyncSender<OutEvent<D>>,
+    k: D::Key,
     mut d: Box<D>,
-) -> JoinHandle<Option<(K, Box<D>)>>
+) -> JoinHandle<Option<(D::Key, Box<D>)>>
 where
-    K: 'static + Send + Clone,
-    D: Driver<K>,
+    D::Key: Send + Clone,
+    D::Event: Send,
 {
     thread::spawn(move || {
         if d.join(|_, event| sender.send(OutEvent::Event(k.clone(), event)).is_ok()) {
