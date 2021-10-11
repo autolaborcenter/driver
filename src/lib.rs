@@ -31,13 +31,11 @@ pub trait Driver: 'static + Send + Sized {
     where
         F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
 
-    fn open_all<I>(keys: I, len: usize, timeout: Duration) -> Vec<(Self::Key, Box<Self>)>
-    where
-        I: IntoIterator<Item = Self::Key>,
-    {
+    fn open_some(len: usize) -> Vec<(Self::Key, Box<Self>)> {
         let mut pacemakers = Vec::new();
         let mut drivers = Vec::new();
-        keys.into_iter()
+        Self::keys()
+            .into_iter()
             .filter_map(|t| Self::new(&t).map(|pair| (t, pair)))
             .for_each(|(t, (p, d))| {
                 pacemakers.push(Box::new(p));
@@ -62,7 +60,7 @@ pub trait Driver: 'static + Send + Sized {
         });
 
         {
-            let deadline = Instant::now() + timeout;
+            let deadline = Instant::now() + Self::open_timeout();
             let counter = Arc::new(());
             drivers
                 .into_iter()
@@ -141,10 +139,7 @@ impl<D: Driver> SupervisorForSingle<D> {
                         break;
                     }
                 },
-                None => match D::open_all(D::keys(), 1, D::open_timeout())
-                    .into_iter()
-                    .next()
-                {
+                None => match D::open_some(1).into_iter().next() {
                     // 上下文为空，重试
                     Some((t, mut driver)) => {
                         // 成功打开驱动
@@ -171,11 +166,7 @@ pub struct SupervisorForMultiple<D: Driver>(Vec<(D::Key, Box<D>)>);
 
 pub enum SupervisorEventForMultiple<'a, D: Driver> {
     Connected(&'a D::Key, &'a mut D),
-    ConnectFailed {
-        current: usize,
-        target: usize,
-        begining: Instant,
-    },
+    ConnectFailed { current: usize, target: usize },
     Event(D::Key, Option<(Instant, D::Event)>),
     Disconnected(D::Key),
 }
@@ -189,11 +180,11 @@ where
         Self(Vec::new())
     }
 
-    pub fn join<F>(&mut self, len: usize, f: F)
+    pub fn join<F>(&mut self, init_len: usize, f: F)
     where
-        F: FnMut(SupervisorEventForMultiple<D>) -> bool,
+        F: FnMut(SupervisorEventForMultiple<D>) -> usize,
     {
-        JoinContextForMultiple::new(self, len, f).run();
+        JoinContextForMultiple::new(self, init_len, f).run();
     }
 }
 

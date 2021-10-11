@@ -12,7 +12,7 @@ pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
     handles: HashMap<<D as Driver>::Key, JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>>,
     sender: SyncSender<OutEvent<D>>,
     receiver: Receiver<OutEvent<D>>,
-    len: usize,
+    target_len: usize,
     f: F,
 }
 
@@ -21,7 +21,7 @@ where
     D: Driver,
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,
-    F: FnMut(SupervisorEventForMultiple<D>) -> bool,
+    F: FnMut(SupervisorEventForMultiple<D>) -> usize,
 {
     pub fn new(parent: &'a mut SupervisorForMultiple<D>, len: usize, f: F) -> Self {
         let (sender, receiver) = sync_channel(2 * len);
@@ -37,7 +37,7 @@ where
             handles,
             sender,
             receiver,
-            len,
+            target_len: len,
             f,
         }
     }
@@ -46,35 +46,31 @@ where
         use SupervisorEventForMultiple::*;
 
         // 尽量接收驱动的消息
-        while (&mut self).receive() {
+        while self.target_len > 0 {
             // 设备数量不足时，尝试打开一些新的设备
-            let begining = Instant::now();
-            let new = D::open_all(D::keys(), self.len - self.handles.len(), D::open_timeout());
+            let new = D::open_some(self.target_len - self.handles.len());
             if new.is_empty() {
                 // 没能打开任何设备，报告
-                if !(self.f)(ConnectFailed {
+                self.target_len = (self.f)(ConnectFailed {
                     current: self.handles.len(),
-                    target: self.len,
-                    begining,
-                }) {
-                    break;
-                }
+                    target: self.target_len,
+                });
             } else {
                 // 打开了一些设备，报告
                 // 所有已打开的设备都要保存到上下文
-                if !new.into_iter().fold(true, |sum, (k, mut d)| {
-                    if sum && (self.f)(Connected(&k, &mut d)) {
+                for (k, mut d) in new.into_iter() {
+                    if self.target_len > 0 {
+                        self.target_len = (self.f)(Connected(&k, &mut d));
+                    }
+                    if self.target_len > 0 {
                         self.handles
                             .insert(k.clone(), spawn(self.sender.clone(), k, d));
-                        true
                     } else {
                         self.parent.0.push((k, d));
-                        false
                     }
-                }) {
-                    break;
                 }
             }
+            self.receive_from_child();
         }
 
         // 结束所有线程，回收驱动对象并保存到上下文
@@ -87,12 +83,11 @@ where
     }
 
     /// 从线程中接收消息
-    fn receive(&mut self) -> bool {
+    fn receive_from_child(&mut self) {
         use SupervisorEventForMultiple::*;
 
-        let mut wait = self.handles.len() >= self.len;
-        loop {
-            let event = if wait {
+        while self.target_len > 0 {
+            let event = if self.handles.len() >= self.target_len {
                 // 当前足够多设备在线，等待所有消息
                 match self.receiver.recv() {
                     Ok(e) => e,
@@ -102,24 +97,17 @@ where
                 // 接收已有消息，没有消息立即退出
                 match self.receiver.try_recv() {
                     Ok(e) => e,
-                    Err(TryRecvError::Empty) => return true,
+                    Err(TryRecvError::Empty) => return,
                     Err(TryRecvError::Disconnected) => panic!("Impossible!"),
                 }
             };
-            match event {
+            self.target_len = match event {
                 // 一般事件
-                OutEvent::Event(which, what) => {
-                    if !(self.f)(Event(which, what)) {
-                        return false;
-                    }
-                }
-                // 有设备断连，检查设备数是否少于目标
+                OutEvent::Event(which, what) => (self.f)(Event(which, what)),
+                // 有设备断连
                 OutEvent::Disconnected(which) => {
                     self.handles.remove(&which);
-                    if !(self.f)(Disconnected(which)) {
-                        return false;
-                    }
-                    wait = self.handles.len() >= self.len;
+                    (self.f)(Disconnected(which))
                 }
             }
         }
