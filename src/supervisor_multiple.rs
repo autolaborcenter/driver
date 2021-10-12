@@ -1,5 +1,5 @@
 ﻿use super::Driver;
-use std::{hash::Hash, time::Instant};
+use std::{hash::Hash, sync::mpsc::SyncSender, time::Instant};
 
 mod context;
 
@@ -7,8 +7,15 @@ pub struct SupervisorForMultiple<D: Driver>(Vec<(D::Key, Box<D>)>);
 
 pub enum SupervisorEventForMultiple<'a, D: Driver> {
     Connected(&'a D::Key, &'a mut D),
-    ConnectFailed { current: usize, target: usize },
-    Event(D::Key, Option<(Instant, D::Event)>),
+    ConnectFailed {
+        current: usize,
+        target: usize,
+    },
+    Event(
+        D::Key,
+        Option<(Instant, D::Event)>,
+        &'a SyncSender<D::Command>,
+    ),
     Disconnected(D::Key),
 }
 
@@ -16,6 +23,7 @@ impl<D: Driver> SupervisorForMultiple<D>
 where
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,
+    D::Command: Send,
 {
     pub fn new() -> Self {
         Self(Vec::new())

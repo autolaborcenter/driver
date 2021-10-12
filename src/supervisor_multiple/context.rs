@@ -10,7 +10,13 @@ use std::{
 
 pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
     parent: &'a mut SupervisorForMultiple<D>,
-    handles: HashMap<<D as Driver>::Key, JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>>,
+    handles: HashMap<
+        <D as Driver>::Key,
+        (
+            SyncSender<D::Command>,
+            JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>,
+        ),
+    >,
     sender: SyncSender<OutEvent<D>>,
     receiver: Receiver<OutEvent<D>>,
     target_len: usize,
@@ -22,6 +28,7 @@ where
     D: Driver,
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,
+    D::Command: Send,
     F: FnMut(SupervisorEventForMultiple<D>) -> usize,
 {
     pub fn new(parent: &'a mut SupervisorForMultiple<D>, len: usize, f: F) -> Self {
@@ -79,7 +86,10 @@ where
         self.parent.0.extend(
             self.handles
                 .into_iter()
-                .filter_map(|(_, handle)| handle.join().ok().flatten()),
+                .filter_map(|(_, (sender, handle))| {
+                    std::mem::drop(sender);
+                    handle.join().ok().flatten()
+                }),
         );
     }
 
@@ -104,7 +114,10 @@ where
             };
             self.target_len = match event {
                 // 一般事件
-                OutEvent::Event(which, what) => (self.f)(Event(which, what)),
+                OutEvent::Event(which, what) => {
+                    let sender = &self.handles.get(&which).unwrap().0;
+                    (self.f)(Event(which, what, sender))
+                }
                 // 有设备断连
                 OutEvent::Disconnected(which) => {
                     self.handles.remove(&which);
@@ -124,17 +137,27 @@ fn spawn<D: Driver>(
     sender: SyncSender<OutEvent<D>>,
     k: D::Key,
     mut d: Box<D>,
-) -> JoinHandle<Option<(D::Key, Box<D>)>>
+) -> (SyncSender<D::Command>, JoinHandle<Option<(D::Key, Box<D>)>>)
 where
     D::Key: Send + Clone,
     D::Event: Send,
+    D::Command: Send,
 {
-    thread::spawn(move || {
-        if d.join(|_, event| sender.send(OutEvent::Event(k.clone(), event)).is_ok()) {
-            Some((k, d))
-        } else {
-            let _ = sender.send(OutEvent::Disconnected(k));
-            None
-        }
-    })
+    let (command_sender, command_receiver) = sync_channel(1);
+    (
+        command_sender,
+        thread::spawn(move || {
+            if d.join(|d, event| {
+                while let Ok(c) = command_receiver.try_recv() {
+                    d.send(c);
+                }
+                sender.send(OutEvent::Event(k.clone(), event)).is_ok()
+            }) {
+                Some((k, d))
+            } else {
+                let _ = sender.send(OutEvent::Disconnected(k));
+                None
+            }
+        }),
+    )
 }

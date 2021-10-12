@@ -27,7 +27,7 @@ pub trait Driver: 'static + Send + Sized {
     fn open_timeout() -> Duration;
 
     fn new(t: &Self::Key) -> Option<(Self::Pacemaker, Self)>;
-    fn send(&mut self, command: (Instant, Self::Command));
+    fn send(&mut self, command: Self::Command);
     fn join<F>(&mut self, f: F) -> bool
     where
         F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
