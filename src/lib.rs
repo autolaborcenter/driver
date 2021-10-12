@@ -4,9 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod indexer;
 mod supervisor_multiple;
 mod supervisor_single;
 
+pub use indexer::Indexer;
 pub use supervisor_multiple::{SupervisorEventForMultiple, SupervisorForMultiple};
 pub use supervisor_single::{SupersivorEventForSingle, SupervisorForSingle};
 
