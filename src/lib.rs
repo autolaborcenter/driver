@@ -1,3 +1,4 @@
+use async_std::task;
 use std::{
     sync::Arc,
     thread,
@@ -35,18 +36,19 @@ pub trait Driver: 'static + Send + Sized {
         F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
 
     fn open_some(len: usize) -> Vec<(Self::Key, Box<Self>)> {
-        let mut pacemakers = Vec::new();
         let mut drivers = Vec::new();
         Self::keys()
             .into_iter()
             .filter_map(|t| Self::new(&t).map(|pair| (t, pair)))
-            .for_each(|(t, (p, d))| {
-                pacemakers.push(Box::new(p));
+            .for_each(|(t, (mut p, d))| {
+                task::spawn(async move {
+                    let period = Self::Pacemaker::period();
+                    while p.send() {
+                        task::sleep(period).await;
+                    }
+                });
                 drivers.push((t, Box::new(d)));
             });
-
-        // 启动一个线程控制这些起搏器
-        thread::spawn(move || send_many(pacemakers));
 
         {
             let deadline = Instant::now() + Self::open_timeout();
@@ -92,26 +94,5 @@ impl DriverPacemaker for () {
 
     fn send(&mut self) -> bool {
         false
-    }
-}
-
-/// 在一个循环中触发多个起搏器
-fn send_many<T: DriverPacemaker>(mut pacemakers: Vec<Box<T>>) {
-    let period = T::period();
-    let mut time = Instant::now();
-    loop {
-        pacemakers = pacemakers
-            .into_iter()
-            .filter_map(|mut s| if s.send() { Some(s) } else { None })
-            .collect();
-        if pacemakers.is_empty() {
-            return;
-        } else {
-            let now = Instant::now();
-            while time <= now {
-                time += period;
-            }
-            thread::sleep(time - now);
-        }
     }
 }

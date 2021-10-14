@@ -1,9 +1,13 @@
 ﻿use super::{SupervisorEventForMultiple, SupervisorForMultiple};
 use crate::Driver;
+use async_std::{
+    channel::{self, Receiver, Sender, TryRecvError},
+    task::block_on,
+};
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::mpsc::*,
+    sync::mpsc,
     thread::{self, JoinHandle},
     time::Instant,
 };
@@ -13,11 +17,11 @@ pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
     handles: HashMap<
         <D as Driver>::Key,
         (
-            SyncSender<D::Command>,
+            mpsc::Sender<D::Command>,
             JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>,
         ),
     >,
-    sender: SyncSender<OutEvent<D>>,
+    sender: Sender<OutEvent<D>>,
     receiver: Receiver<OutEvent<D>>,
     target_len: usize,
     f: F,
@@ -32,7 +36,7 @@ where
     F: FnMut(SupervisorEventForMultiple<D>) -> usize,
 {
     pub fn new(parent: &'a mut SupervisorForMultiple<D>, len: usize, f: F) -> Self {
-        let (sender, receiver) = sync_channel(2 * len);
+        let (sender, receiver) = channel::unbounded();
 
         // 取出上下文中保存的驱动对象
         let handles = std::mem::replace(&mut parent.0, Vec::new())
@@ -78,7 +82,7 @@ where
                     }
                 }
             }
-            self.receive_from_child();
+            block_on(async { self.receive_from_child().await });
         }
 
         // 结束所有线程，回收驱动对象并保存到上下文
@@ -94,13 +98,13 @@ where
     }
 
     /// 从线程中接收消息
-    fn receive_from_child(&mut self) {
+    async fn receive_from_child(&mut self) {
         use SupervisorEventForMultiple::*;
 
         while self.target_len > 0 {
             let event = if self.handles.len() >= self.target_len {
                 // 当前足够多设备在线，等待所有消息
-                match self.receiver.recv() {
+                match self.receiver.recv().await {
                     Ok(e) => e,
                     Err(_) => panic!("Impossible!"),
                 }
@@ -109,7 +113,7 @@ where
                 match self.receiver.try_recv() {
                     Ok(e) => e,
                     Err(TryRecvError::Empty) => return,
-                    Err(TryRecvError::Disconnected) => panic!("Impossible!"),
+                    Err(TryRecvError::Closed) => panic!("Impossible!"),
                 }
             };
             self.target_len = match event {
@@ -134,16 +138,19 @@ enum OutEvent<D: Driver> {
 }
 
 fn spawn<D: Driver>(
-    sender: SyncSender<OutEvent<D>>,
+    sender: Sender<OutEvent<D>>,
     k: D::Key,
     mut d: Box<D>,
-) -> (SyncSender<D::Command>, JoinHandle<Option<(D::Key, Box<D>)>>)
+) -> (
+    mpsc::Sender<D::Command>,
+    JoinHandle<Option<(D::Key, Box<D>)>>,
+)
 where
     D::Key: Send + Clone,
     D::Event: Send,
     D::Command: Send,
 {
-    let (command_sender, command_receiver) = sync_channel(1);
+    let (command_sender, command_receiver) = mpsc::channel();
     (
         command_sender,
         thread::spawn(move || {
@@ -151,7 +158,7 @@ where
                 while let Ok(c) = command_receiver.try_recv() {
                     d.send(c);
                 }
-                sender.send(OutEvent::Event(k.clone(), event)).is_ok()
+                block_on(async { sender.send(OutEvent::Event(k.clone(), event)).await.is_ok() })
             }) {
                 Some((k, d))
             } else {

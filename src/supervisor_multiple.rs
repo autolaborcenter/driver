@@ -1,5 +1,5 @@
 ﻿use super::Driver;
-use std::{hash::Hash, sync::mpsc::SyncSender, time::Instant};
+use std::{hash::Hash, sync::mpsc, time::Instant};
 
 mod context;
 
@@ -14,7 +14,7 @@ pub enum SupervisorEventForMultiple<'a, D: Driver> {
     Event(
         D::Key,
         Option<(Instant, D::Event)>,
-        &'a SyncSender<D::Command>,
+        &'a mpsc::Sender<D::Command>,
     ),
     Disconnected(D::Key),
 }
