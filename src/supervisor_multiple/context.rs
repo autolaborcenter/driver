@@ -2,7 +2,7 @@
 use crate::Driver;
 use async_std::{
     channel::{self, Receiver, Sender, TryRecvError},
-    task::block_on,
+    task::{self, block_on},
 };
 use std::{
     collections::HashMap,
@@ -24,6 +24,7 @@ pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
     sender: Sender<OutEvent<D>>,
     receiver: Receiver<OutEvent<D>>,
     target_len: usize,
+    next_try: Instant,
     f: F,
 }
 
@@ -50,6 +51,7 @@ where
             sender,
             receiver,
             target_len: len,
+            next_try: Instant::now(),
             f,
         }
     }
@@ -59,6 +61,8 @@ where
 
         // 尽量接收驱动的消息
         while self.target_len > 0 {
+            // 接收消息
+            block_on(async { self.receive_from_child().await });
             // 设备数量不足时，尝试打开一些新的设备
             let new = D::open_some(self.target_len - self.handles.len());
             if new.is_empty() {
@@ -66,6 +70,7 @@ where
                 self.target_len = (self.f)(ConnectFailed {
                     current: self.handles.len(),
                     target: self.target_len,
+                    next_try: &mut self.next_try,
                 });
             } else {
                 // 打开了一些设备，报告
@@ -82,7 +87,6 @@ where
                     }
                 }
             }
-            block_on(async { self.receive_from_child().await });
         }
 
         // 结束所有线程，回收驱动对象并保存到上下文
@@ -102,18 +106,25 @@ where
         use SupervisorEventForMultiple::*;
 
         while self.target_len > 0 {
-            let event = if self.handles.len() >= self.target_len {
-                // 当前足够多设备在线，等待所有消息
+            let wait = self.next_try.checked_duration_since(Instant::now());
+            let event = if self.handles.is_empty() {
+                // 没有任何在线的设备了，等待到重试的时机并退出
+                if let Some(dur) = wait {
+                    task::sleep(dur).await;
+                }
+                return;
+            } else if wait.is_some() || self.handles.len() >= self.target_len {
+                // 还不到重试的时候或已有足够多设备在线，等待所有消息
                 match self.receiver.recv().await {
                     Ok(e) => e,
-                    Err(_) => panic!("Impossible!"),
+                    Err(_) => panic!("Impossible!"), // 就算没有任何设备在线，Self 里也存了一个 Sender
                 }
             } else {
                 // 接收已有消息，没有消息立即退出
                 match self.receiver.try_recv() {
                     Ok(e) => e,
                     Err(TryRecvError::Empty) => return,
-                    Err(TryRecvError::Closed) => panic!("Impossible!"),
+                    Err(TryRecvError::Closed) => panic!("Impossible!"), // 就算没有任何设备在线，Self 里也存了一个 Sender
                 }
             };
             self.target_len = match event {

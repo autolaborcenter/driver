@@ -10,6 +10,7 @@ pub enum SupervisorEventForMultiple<'a, D: Driver> {
     ConnectFailed {
         current: usize,
         target: usize,
+        next_try: &'a mut Instant,
     },
     Event(
         D::Key,

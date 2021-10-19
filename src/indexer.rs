@@ -11,6 +11,14 @@ where
         Self(Vec::new(), capacity)
     }
 
+    pub fn is_full(&self) -> bool {
+        self.0.len() == self.1
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn add(&mut self, k: T) -> Option<usize> {
         let mut i = 0;
         while i < self.0.len() {
