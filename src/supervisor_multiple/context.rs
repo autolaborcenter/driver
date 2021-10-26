@@ -169,11 +169,11 @@ where
                 while let Ok(c) = command_receiver.try_recv() {
                     d.send(c);
                 }
-                block_on(async { sender.send(OutEvent::Event(k.clone(), event)).await.is_ok() })
+                block_on(sender.send(OutEvent::Event(k.clone(), event))).is_ok()
             }) {
                 Some((k, d))
             } else {
-                let _ = sender.send(OutEvent::Disconnected(k));
+                let _ = block_on(sender.send(OutEvent::Disconnected(k)));
                 None
             }
         }),
