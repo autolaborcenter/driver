@@ -15,10 +15,6 @@ where
     T: Ord,
 {
     pub fn new(capacity: usize) -> Self {
-        if capacity < 2 {
-            panic!("排序器至少有 2 个容量");
-        }
-
         let mut pinned = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             pinned.push(None);
@@ -97,7 +93,7 @@ where
         Some(i)
     }
 
-    pub fn remove(&mut self, t: T) -> Option<usize> {
+    pub fn remove(&mut self, t: &T) -> Option<usize> {
         let tail = self.pinned.len() - 1;
         for i in (0..=tail).rev() {
             if let Some(ref item) = self.get(i) {
@@ -117,7 +113,7 @@ where
                     Less => {
                         std::mem::replace(&mut self.waiting, Default::default())
                             .into_iter()
-                            .filter(|it| t != *it)
+                            .filter(|it| t != it)
                             .for_each(|it| self.waiting.push(it));
                         return None;
                     }
@@ -132,9 +128,9 @@ where
         for i in (0..self.pinned.len()).rev() {
             if let Some(ref item) = self.get(i) {
                 match t.cmp(item) {
-                    Less => {}
+                    Less => return None,
                     Equal => return Some(i),
-                    Greater => return None,
+                    Greater => {}
                 }
             }
         }
@@ -282,8 +278,8 @@ mod t {
         assert_eq!(indexer.len(), 5);
         assert!(indexer.is_full());
         // 移除
-        indexer.remove(7);
-        indexer.remove(3);
+        indexer.remove(&7);
+        indexer.remove(&3);
         assert_eq!(indexer.pinned, vec![None, Some(6), Some(4), None, Some(2)]);
         assert_eq!(
             vec_modified(&indexer),
@@ -334,12 +330,20 @@ mod t {
             vec![false, false, true, false, true]
         );
         // 补充
-        indexer.remove(5);
+        indexer.remove(&5);
         assert_eq!(
             indexer.pinned,
             vec![Some(6), Some(4), Some(3), Some(2), Some(1)]
         );
         assert_eq!(vec_waiting(&indexer), vec![0]);
         assert_eq!(vec_modified(&indexer), vec![false, true, true, true, false]);
+        // 查找
+        assert_eq!(indexer.find(&7), None);
+        assert_eq!(indexer.find(&6), Some(0));
+        assert_eq!(indexer.find(&4), Some(1));
+        assert_eq!(indexer.find(&3), Some(2));
+        assert_eq!(indexer.find(&2), Some(3));
+        assert_eq!(indexer.find(&1), Some(4));
+        assert_eq!(indexer.find(&0), None);
     }
 }
