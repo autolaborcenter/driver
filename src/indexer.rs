@@ -97,30 +97,35 @@ where
         Some(i)
     }
 
-    pub fn remove(&mut self, t: T) -> bool {
+    pub fn remove(&mut self, t: T) -> Option<usize> {
         let tail = self.pinned.len() - 1;
         for i in (0..=tail).rev() {
             if let Some(ref item) = self.get(i) {
                 match t.cmp(item) {
                     Equal => {
-                        match self.waiting.pop() {
-                            Some(t) => self.put_forward(i..tail, t),
-                            None => self.remove_at(i),
+                        return match self.waiting.pop() {
+                            Some(t) => {
+                                self.put_forward(i..tail, t);
+                                None
+                            }
+                            None => {
+                                self.remove_at(i);
+                                Some(i)
+                            }
                         };
-                        return true;
                     }
                     Less => {
                         std::mem::replace(&mut self.waiting, Default::default())
                             .into_iter()
                             .filter(|it| t != *it)
                             .for_each(|it| self.waiting.push(it));
-                        return false;
+                        return None;
                     }
                     Greater => {}
                 }
             }
         }
-        return false;
+        return None;
     }
 
     pub fn find(&self, t: &T) -> Option<usize> {
