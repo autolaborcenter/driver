@@ -1,16 +1,14 @@
-﻿use std::{
-    cmp::Ordering::*,
-    collections::{BinaryHeap, HashSet},
-    ops::Range,
-};
+﻿use std::{cmp::Ordering::*, collections::BinaryHeap, ops::Range};
 
 /// 为键排序并标号
 pub struct Indexer<T> {
     pinned: Vec<Option<T>>,
+    modified: FlagVec,
     waiting: BinaryHeap<T>,
-    modified: HashSet<usize>,
     len: usize,
 }
+
+struct FlagVec(Vec<u8>);
 
 impl<T> Indexer<T>
 where
@@ -27,8 +25,8 @@ where
         }
         Self {
             pinned,
+            modified: FlagVec::with_capacity(capacity),
             waiting: Default::default(),
-            modified: Default::default(),
             len: 0,
         }
     }
@@ -67,10 +65,8 @@ where
                 match self.get(i) {
                     Some(it) => match t.cmp(it) {
                         Less => {
-                            // 找到下一个空位
-                            let hole = self.find_hole(i);
                             // t 已放在 i 处
-                            self.put_forward(hole..i, t);
+                            self.put_somewhere_forward(i, t);
                             return Some(i);
                         }
                         Greater => i -= 1,
@@ -101,7 +97,7 @@ where
         Some(i)
     }
 
-    pub fn remove(&mut self, t: T) {
+    pub fn remove(&mut self, t: T) -> bool {
         let tail = self.pinned.len() - 1;
         for i in (0..=tail).rev() {
             if let Some(ref item) = self.get(i) {
@@ -111,19 +107,20 @@ where
                             Some(t) => self.put_forward(i..tail, t),
                             None => self.remove_at(i),
                         };
-                        break;
+                        return true;
                     }
                     Less => {
                         std::mem::replace(&mut self.waiting, Default::default())
                             .into_iter()
                             .filter(|it| t != *it)
                             .for_each(|it| self.waiting.push(it));
-                        break;
+                        return false;
                     }
                     Greater => {}
                 }
             }
         }
+        return false;
     }
 
     pub fn find(&self, t: &T) -> Option<usize> {
@@ -140,7 +137,7 @@ where
     }
 
     pub fn update(&mut self, i: usize) -> bool {
-        self.modified.remove(&i)
+        unsafe { self.modified.clear(i) }
     }
 
     #[inline]
@@ -162,8 +159,27 @@ where
     #[inline]
     fn remove_at(&mut self, i: usize) {
         *self.get_mut(i) = None;
-        self.modified.remove(&i);
+        unsafe { self.modified.clear(i) };
         self.len -= 1;
+    }
+
+    /// 将 t 填充到 i 并移动到找到一个空位
+    /// 不知道空位在何处
+    #[inline]
+    fn put_somewhere_forward(&mut self, i: usize, mut t: T) {
+        t = std::mem::replace(self.get_mut(i).as_mut().unwrap(), t);
+        unsafe { self.modified.clear(i) };
+        self.len += 1;
+        for i in (0..i).rev() {
+            unsafe { self.modified.set(i) };
+            match self.get_mut(i) {
+                Some(t_) => t = std::mem::replace(t_, t),
+                None => {
+                    *self.get_mut(i) = Some(t);
+                    return;
+                }
+            }
+        }
     }
 
     /// 将空位以 t 填充并移动到范围另一端
@@ -172,10 +188,10 @@ where
     fn put_forward(&mut self, range: Range<usize>, t: T) {
         self.len += 1;
         *self.get_mut(range.start) = Some(t);
-        self.modified.remove(&range.end);
+        unsafe { self.modified.clear(range.end) };
         for i in range {
             self.pinned.swap(i, i + 1);
-            self.modified.insert(i);
+            unsafe { self.modified.set(i) };
         }
     }
 
@@ -185,23 +201,29 @@ where
     fn put_backward(&mut self, range: Range<usize>, t: T) {
         self.len += 1;
         *self.get_mut(range.end) = Some(t);
-        self.modified.remove(&range.start);
+        unsafe { self.modified.clear(range.start) };
         for i in range.rev() {
             self.pinned.swap(i, i + 1);
-            self.modified.insert(i + 1);
+            unsafe { self.modified.set(i + 1) };
         }
     }
+}
 
-    /// 找下一个空位
-    #[inline]
-    fn find_hole(&mut self, mut i: usize) -> usize {
-        while i > 0 {
-            i -= 1;
-            if self.get(i).is_none() {
-                return i;
-            }
-        }
-        return self.pinned.len();
+impl FlagVec {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(vec![0; (capacity + 7) / 8])
+    }
+
+    unsafe fn set(&mut self, i: usize) {
+        *self.0.get_unchecked_mut(i / 8) |= 1 << (i % 8);
+    }
+
+    unsafe fn clear(&mut self, i: usize) -> bool {
+        let block = self.0.get_unchecked_mut(i / 8);
+        let mask = 1 << (i % 8);
+        let result = (*block & mask) != 0;
+        *block &= !mask;
+        result
     }
 }
 
@@ -210,10 +232,14 @@ mod t {
     use super::*;
 
     #[inline]
-    fn vec_modified<T: Ord>(indexer: &Indexer<T>) -> Vec<usize> {
-        let mut x = indexer.modified.iter().map(|r| *r).collect::<Vec<_>>();
-        x.sort();
-        x
+    fn vec_modified<T: Ord>(indexer: &Indexer<T>) -> Vec<bool> {
+        let mut result = vec![false; indexer.pinned.len()];
+        for i in 0..indexer.pinned.len() {
+            if (indexer.modified.0[i / 8] & (1 << (i % 8))) != 0 {
+                result[i] = true;
+            }
+        }
+        result
     }
 
     #[inline]
@@ -232,9 +258,12 @@ mod t {
         // 从空插入
         assert_eq!(indexer.add(6), Some(0));
         assert_eq!(indexer.pinned, vec![Some(6), None, None, None, None]);
+        assert_eq!(
+            vec_modified(&indexer),
+            vec![false, false, false, false, false]
+        );
         assert_eq!(indexer.len(), 1);
         assert!(!indexer.is_full());
-        assert!(indexer.modified.is_empty());
         // 排序插入
         assert_eq!(indexer.add(3), Some(1));
         assert_eq!(indexer.add(2), Some(2));
@@ -244,33 +273,39 @@ mod t {
             indexer.pinned,
             vec![Some(7), Some(6), Some(4), Some(3), Some(2)]
         );
-        assert_eq!(vec_modified(&indexer), vec![1, 3, 4]);
+        assert_eq!(vec_modified(&indexer), vec![false, true, false, true, true]);
         assert_eq!(indexer.len(), 5);
         assert!(indexer.is_full());
         // 移除
         indexer.remove(7);
         indexer.remove(3);
         assert_eq!(indexer.pinned, vec![None, Some(6), Some(4), None, Some(2)]);
-        assert_eq!(vec_modified(&indexer), vec![1, 4]);
+        assert_eq!(
+            vec_modified(&indexer),
+            vec![false, true, false, false, true]
+        );
         // 推
         indexer.add(5);
         assert_eq!(
             indexer.pinned,
             vec![None, Some(6), Some(5), Some(4), Some(2)]
         );
-        assert_eq!(vec_modified(&indexer), vec![1, 3, 4]);
+        assert_eq!(vec_modified(&indexer), vec![false, true, false, true, true]);
         indexer.add(1);
         assert_eq!(
             indexer.pinned,
             vec![Some(6), Some(5), Some(4), Some(2), Some(1)]
         );
-        assert_eq!(vec_modified(&indexer), vec![0, 1, 2, 3]);
+        assert_eq!(vec_modified(&indexer), vec![true, true, true, true, false]);
         // 更新
         assert!(indexer.update(0));
         assert!(indexer.update(1));
         assert!(indexer.update(3));
         assert!(!indexer.update(3));
-        assert_eq!(vec_modified(&indexer), vec![2]);
+        assert_eq!(
+            vec_modified(&indexer),
+            vec![false, false, true, false, false]
+        );
         // 直接排队
         assert_eq!(indexer.add(0), None);
         assert_eq!(
@@ -278,7 +313,10 @@ mod t {
             vec![Some(6), Some(5), Some(4), Some(2), Some(1)]
         );
         assert_eq!(vec_waiting(&indexer), vec![0]);
-        assert_eq!(vec_modified(&indexer), vec![2]);
+        assert_eq!(
+            vec_modified(&indexer),
+            vec![false, false, true, false, false]
+        );
         // 替换排队
         assert_eq!(indexer.add(3), Some(3));
         assert_eq!(
@@ -286,7 +324,10 @@ mod t {
             vec![Some(6), Some(5), Some(4), Some(3), Some(2)]
         );
         assert_eq!(vec_waiting(&indexer), vec![0, 1]);
-        assert_eq!(vec_modified(&indexer), vec![2, 4]);
+        assert_eq!(
+            vec_modified(&indexer),
+            vec![false, false, true, false, true]
+        );
         // 补充
         indexer.remove(5);
         assert_eq!(
@@ -294,6 +335,6 @@ mod t {
             vec![Some(6), Some(4), Some(3), Some(2), Some(1)]
         );
         assert_eq!(vec_waiting(&indexer), vec![0]);
-        assert_eq!(vec_modified(&indexer), vec![1, 2, 3]);
+        assert_eq!(vec_modified(&indexer), vec![false, true, true, true, false]);
     }
 }
