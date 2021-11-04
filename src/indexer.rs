@@ -1,4 +1,8 @@
-﻿use std::{cmp::Ordering::*, collections::BinaryHeap, ops::Range};
+﻿use std::{
+    cmp::Ordering::{self, *},
+    collections::BinaryHeap,
+    ops::Range,
+};
 
 /// 为键排序并标号
 pub struct Indexer<T> {
@@ -6,6 +10,7 @@ pub struct Indexer<T> {
     modified: FlagVec,
     waiting: BinaryHeap<T>,
     len: usize,
+    reversed: bool,
 }
 
 struct FlagVec(Vec<u8>);
@@ -24,13 +29,29 @@ where
             modified: FlagVec::with_capacity(capacity),
             waiting: Default::default(),
             len: 0,
+            reversed: false,
         }
     }
 
+    #[inline]
+    pub fn new_reversed(capacity: usize) -> Self {
+        Self {
+            reversed: true,
+            ..Self::new(capacity)
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.len == self.pinned.len()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -39,7 +60,7 @@ where
         let tail = self.pinned.len() - 1;
         // 没有空位，检查 t 是否应该等待
         let mut hole = if self.is_full() {
-            match t.cmp(self.get_value(tail)) {
+            match self.cmp(&t, self.get_value(tail)) {
                 Less => {
                     // t 进入等待队列，无事发生
                     self.waiting.push(t);
@@ -59,7 +80,7 @@ where
             let mut i = tail;
             loop {
                 match self.get(i) {
-                    Some(it) => match t.cmp(it) {
+                    Some(it) => match self.cmp(&t, it) {
                         Less => {
                             // t 已放在 i 处
                             self.put_somewhere_forward(i, t);
@@ -77,7 +98,7 @@ where
         while i > 0 {
             i -= 1;
             match self.get(i) {
-                Some(ref item) => match t.cmp(item) {
+                Some(ref item) => match self.cmp(&t, item) {
                     Less => {
                         i += 1;
                         break;
@@ -97,7 +118,7 @@ where
         let tail = self.pinned.len() - 1;
         for i in (0..=tail).rev() {
             if let Some(ref item) = self.get(i) {
-                match t.cmp(item) {
+                match self.cmp(&t, item) {
                     Equal => {
                         return match self.waiting.pop() {
                             Some(t) => {
@@ -127,7 +148,7 @@ where
     pub fn find(&self, t: &T) -> Option<usize> {
         for i in (0..self.pinned.len()).rev() {
             if let Some(ref item) = self.get(i) {
-                match t.cmp(item) {
+                match self.cmp(&t, item) {
                     Less => return None,
                     Equal => return Some(i),
                     Greater => {}
@@ -137,6 +158,7 @@ where
         None
     }
 
+    #[inline]
     pub fn update(&mut self, i: usize) -> bool {
         unsafe { self.modified.clear(i) }
     }
@@ -154,6 +176,20 @@ where
     #[inline]
     fn get_value<'a>(&'a self, i: usize) -> &'a T {
         self.get(i).as_ref().unwrap()
+    }
+
+    #[inline]
+    fn cmp(&self, a: &T, b: &T) -> Ordering {
+        if self.reversed {
+            use Ordering::*;
+            match a.cmp(b) {
+                Less => Greater,
+                Greater => Less,
+                Equal => Equal,
+            }
+        } else {
+            a.cmp(b)
+        }
     }
 
     /// 将 i 以 t 填充
