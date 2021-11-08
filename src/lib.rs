@@ -1,7 +1,6 @@
 use async_std::task;
 use std::{
     sync::Arc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -10,7 +9,9 @@ mod supervisor_multiple;
 mod supervisor_single;
 
 pub use indexer::Indexer;
-pub use supervisor_multiple::{SupervisorEventForMultiple, SupervisorForMultiple};
+pub use supervisor_multiple::{
+    MultipleDeviceDriver, SupervisorEventForMultiple, SupervisorForMultiple,
+};
 pub use supervisor_single::{SupersivorEventForSingle, SupervisorForSingle};
 
 /// 实现驱动特性，需要指定其对应的起搏器类型、状态类型和指令类型。
@@ -19,18 +20,25 @@ pub use supervisor_single::{SupersivorEventForSingle, SupervisorForSingle};
 ///
 /// 可以从驱动中读取状态，或向驱动发送指令。
 ///
-/// 监听驱动事件是独占且阻塞的，但在传入的回调中可以修改驱动状态。
+/// 监听驱动事件是独占且阻塞的，但在传入的回调中可以向其中发送指令。
 pub trait Driver: 'static + Send + Sized {
-    type Key;
     type Pacemaker: DriverPacemaker + Send;
+    type Key;
     type Event;
-    type Command;
 
     fn keys() -> Vec<Self::Key>;
     fn open_timeout() -> Duration;
 
     fn new(t: &Self::Key) -> Option<(Self::Pacemaker, Self)>;
-    fn send(&mut self, command: Self::Command);
+
+    /// 阻塞等待驱动退出
+    ///
+    /// 驱动可能因为两种原因退出：
+    ///
+    /// 1. 主动退出，方法返回 true
+    /// 2. 内部错误（断开、超时或其他异常），方法返回 false
+    ///
+    /// 调用时传入回调函数 `f`。`f` 用于传出驱动对象的可变引用和驱动事件，返回 false 时驱动将主动退出。
     fn join<F>(&mut self, f: F) -> bool
     where
         F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
@@ -54,20 +62,19 @@ pub trait Driver: 'static + Send + Sized {
             .collect();
 
         // 打开临时的监控以筛除不产生正确输出的设备
-        // 用一个 Arc 来计数
-        let counter = Arc::new(());
-        let deadline = Instant::now() + Self::open_timeout();
+        let counter = Arc::new(()); // ---------------------- // 用一个 Arc 来计数
+        let deadline = Instant::now() + Self::open_timeout(); // 从这里开始计算超时
         let drivers = drivers
             .into_iter()
-            .map(|(t, mut o)| {
+            .map(|(t, mut d)| {
                 let counter = counter.clone();
                 (
                     t,
-                    thread::spawn(move || {
-                        if o.join(|_, _| {
+                    task::spawn_blocking(move || {
+                        if d.join(|_, _| {
                             Arc::strong_count(&counter) > len && Instant::now() < deadline
                         }) {
-                            Some(o)
+                            Some(d)
                         } else {
                             None
                         }
@@ -80,7 +87,7 @@ pub trait Driver: 'static + Send + Sized {
         // 收集正确打开的驱动
         drivers
             .into_iter()
-            .filter_map(|(t, o)| o.join().ok().flatten().map(|b| (t, b)))
+            .filter_map(|(t, o)| task::block_on(o).map(|b| (t, b)))
             .collect()
     }
 }

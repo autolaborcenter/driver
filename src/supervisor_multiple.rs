@@ -3,9 +3,14 @@ use std::{hash::Hash, sync::mpsc, time::Instant};
 
 mod context;
 
+pub trait MultipleDeviceDriver: Driver {
+    type Command;
+    fn send(&mut self, command: Self::Command);
+}
+
 pub struct SupervisorForMultiple<D: Driver>(Vec<(D::Key, Box<D>)>);
 
-pub enum SupervisorEventForMultiple<'a, D: Driver> {
+pub enum SupervisorEventForMultiple<'a, D: MultipleDeviceDriver> {
     Connected(&'a D::Key, &'a mut D),
     ConnectFailed {
         current: usize,
@@ -20,7 +25,7 @@ pub enum SupervisorEventForMultiple<'a, D: Driver> {
     Disconnected(D::Key),
 }
 
-impl<D: Driver> SupervisorForMultiple<D>
+impl<D: MultipleDeviceDriver> SupervisorForMultiple<D>
 where
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,

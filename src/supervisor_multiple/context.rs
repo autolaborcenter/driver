@@ -1,18 +1,12 @@
 ﻿use super::{SupervisorEventForMultiple, SupervisorForMultiple};
-use crate::Driver;
+use crate::{Driver, MultipleDeviceDriver};
 use async_std::{
     channel::{self, Receiver, Sender, TryRecvError},
-    task::{self, block_on},
+    task::{self, block_on, JoinHandle},
 };
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    sync::mpsc,
-    thread::{self, JoinHandle},
-    time::Instant,
-};
+use std::{collections::HashMap, hash::Hash, sync::mpsc, time::Instant};
 
-pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
+pub(super) struct JoinContextForMultiple<'a, D: MultipleDeviceDriver, F> {
     parent: &'a mut SupervisorForMultiple<D>,
     handles: HashMap<
         <D as Driver>::Key,
@@ -30,7 +24,7 @@ pub(super) struct JoinContextForMultiple<'a, D: Driver, F> {
 
 impl<'a, D, F> JoinContextForMultiple<'a, D, F>
 where
-    D: Driver,
+    D: MultipleDeviceDriver,
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,
     D::Command: Send,
@@ -96,7 +90,7 @@ where
                 .into_iter()
                 .filter_map(|(_, (sender, handle))| {
                     std::mem::drop(sender);
-                    handle.join().ok().flatten()
+                    task::block_on(handle)
                 }),
         );
     }
@@ -148,7 +142,7 @@ enum OutEvent<D: Driver> {
     Disconnected(D::Key),
 }
 
-fn spawn<D: Driver>(
+fn spawn<D: MultipleDeviceDriver>(
     sender: Sender<OutEvent<D>>,
     k: D::Key,
     mut d: Box<D>,
@@ -164,7 +158,7 @@ where
     let (command_sender, command_receiver) = mpsc::channel();
     (
         command_sender,
-        thread::spawn(move || {
+        task::spawn_blocking(move || {
             if d.join(|d, event| {
                 while let Ok(c) = command_receiver.try_recv() {
                     d.send(c);
