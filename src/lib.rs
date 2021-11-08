@@ -36,45 +36,52 @@ pub trait Driver: 'static + Send + Sized {
         F: FnMut(&mut Self, Option<(Instant, Self::Event)>) -> bool;
 
     fn open_some(len: usize) -> Vec<(Self::Key, Box<Self>)> {
-        let mut drivers = Vec::new();
-        Self::keys()
+        // 打开所有可能的驱动并启动起搏器
+        // 这段的耗时不计入超时
+        let drivers: Vec<_> = Self::keys()
             .into_iter()
-            .filter_map(|t| Self::new(&t).map(|pair| (t, pair)))
-            .for_each(|(t, (mut p, d))| {
-                task::spawn(async move {
-                    let period = Self::Pacemaker::period();
-                    while p.send() {
-                        task::sleep(period).await;
-                    }
-                });
-                drivers.push((t, Box::new(d)));
-            });
-
-        {
-            let deadline = Instant::now() + Self::open_timeout();
-            let counter = Arc::new(());
-            drivers
-                .into_iter()
-                .map(|(t, mut o)| {
-                    let counter = counter.clone();
-                    (
-                        t,
-                        thread::spawn(move || {
-                            if o.join(|_, _| {
-                                Arc::strong_count(&counter) > len && Instant::now() < deadline
-                            }) {
-                                Some(o)
-                            } else {
-                                None
-                            }
-                        }),
-                    )
+            .filter_map(|t| {
+                Self::new(&t).map(|(mut p, d)| {
+                    task::spawn(async move {
+                        let period = Self::Pacemaker::period();
+                        while p.send() {
+                            task::sleep(period).await;
+                        }
+                    });
+                    (t, Box::new(d))
                 })
-                .collect::<Vec<_>>()
-        } // 离开作用域时销毁本地的计数器，使计数等于线程数
-        .into_iter()
-        .filter_map(|(t, o)| o.join().ok().flatten().map(|b| (t, b)))
-        .collect()
+            })
+            .collect();
+
+        // 打开临时的监控以筛除不产生正确输出的设备
+        // 用一个 Arc 来计数
+        let counter = Arc::new(());
+        let deadline = Instant::now() + Self::open_timeout();
+        let drivers = drivers
+            .into_iter()
+            .map(|(t, mut o)| {
+                let counter = counter.clone();
+                (
+                    t,
+                    thread::spawn(move || {
+                        if o.join(|_, _| {
+                            Arc::strong_count(&counter) > len && Instant::now() < deadline
+                        }) {
+                            Some(o)
+                        } else {
+                            None
+                        }
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        std::mem::drop(counter); // 丢弃外面的引用，此后引用计数 === 存活的驱动数
+
+        // 收集正确打开的驱动
+        drivers
+            .into_iter()
+            .filter_map(|(t, o)| o.join().ok().flatten().map(|b| (t, b)))
+            .collect()
     }
 }
 
@@ -82,7 +89,10 @@ pub trait Driver: 'static + Send + Sized {
 ///
 /// 应该根据这个周期定时发送触发脉冲。
 pub trait DriverPacemaker {
+    /// 发送周期
     fn period() -> Duration;
+
+    /// 发送一个触发脉冲，返回是否需要继续发送
     fn send(&mut self) -> bool;
 }
 
