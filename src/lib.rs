@@ -12,7 +12,7 @@ pub use indexer::Indexer;
 pub use supervisor_multiple::{
     MultipleDeviceDriver, SupervisorEventForMultiple, SupervisorForMultiple,
 };
-pub use supervisor_single::{SupersivorEventForSingle, SupervisorForSingle};
+pub use supervisor_single::{SupervisorEventForSingle, SupervisorForSingle};
 
 /// 实现驱动特性，需要指定其对应的起搏器类型、状态类型和指令类型。
 ///
