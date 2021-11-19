@@ -1,7 +1,7 @@
 ﻿use super::Driver;
 use std::time::Instant;
 
-pub struct SupervisorForSingle<D: Driver>(Box<Option<D>>);
+pub struct SupervisorForSingle<D: Driver>(Option<Box<D>>);
 
 pub enum SupersivorEventForSingle<'a, D: Driver> {
     Connected(<D as Driver>::Key, &'a mut D),
@@ -12,7 +12,7 @@ pub enum SupersivorEventForSingle<'a, D: Driver> {
 
 impl<D: Driver> SupervisorForSingle<D> {
     pub fn new() -> Self {
-        Self(Box::new(None))
+        Self(None)
     }
 
     pub fn join<F>(&mut self, mut f: F)
@@ -20,38 +20,33 @@ impl<D: Driver> SupervisorForSingle<D> {
         F: FnMut(SupersivorEventForSingle<D>) -> bool,
     {
         loop {
+            // 取出上下文中保存的驱动
+            if let Some(mut driver) = self.0.take() {
+                // 驱动主动退出，立即释放
+                // 或
+                // 驱动断联后不希望再次尝试
+                if driver.join(|d, e| f(Event(d, e))) || !f(Disconnected) {
+                    return;
+                }
+            }
+            // 上下文中驱动已取出
             use SupersivorEventForSingle::*;
-
-            match self.0.as_mut() {
-                Some(ref mut driver) => loop {
-                    // 上下文中保存了驱动
-                    if driver.join(|d, e| f(Event(d, e))) || !f(Disconnected) {
-                        // 驱动退出阻塞或断联后不希望重试
+            match D::open_some(1).into_iter().next() {
+                Some((t, mut driver)) => {
+                    // 成功打开驱动
+                    if !f(Connected(t, &mut *driver)) {
                         return;
                     } else {
-                        // 清除上下文，重试
-                        self.0 = Box::new(None);
-                        break;
+                        self.0 = Some(Box::new(*driver));
+                        continue;
                     }
-                },
-                None => match D::open_some(1).into_iter().next() {
-                    // 上下文为空，重试
-                    Some((t, mut driver)) => {
-                        // 成功打开驱动
-                        if !f(Connected(t, &mut *driver)) {
-                            return;
-                        } else {
-                            self.0 = Box::new(Some(*driver));
-                            continue;
-                        }
+                }
+                None => {
+                    // 未能打开驱动
+                    if !f(ConnectFailed) {
+                        return;
                     }
-                    None => {
-                        // 未能打开驱动
-                        if !f(ConnectFailed) {
-                            return;
-                        }
-                    }
-                },
+                }
             }
         }
     }

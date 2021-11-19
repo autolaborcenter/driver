@@ -4,7 +4,7 @@
     ops::Range,
 };
 
-/// 为键排序并标号
+/// 仅依据键对设备排序的排序器，用于稳定区分数据上没有区别的两个驱动程序
 pub struct Indexer<T> {
     pinned: Vec<Option<T>>,
     modified: FlagVec,
