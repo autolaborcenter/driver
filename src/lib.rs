@@ -60,10 +60,15 @@ pub trait Driver: 'static + Send + Sized {
                 })
             })
             .collect();
-
+        // 如果超时为 0，直接退出
+        let open_timeout = Self::open_timeout();
+        let deadline = if open_timeout != Duration::ZERO {
+            Instant::now() + open_timeout
+        } else {
+            return drivers;
+        };
         // 打开临时的监控以筛除不产生正确输出的设备
         let counter = Arc::new(()); // ---------------------- // 用一个 Arc 来计数
-        let deadline = Instant::now() + Self::open_timeout(); // 从这里开始计算超时
         let drivers = drivers
             .into_iter()
             .map(|(t, mut d)| {
@@ -83,8 +88,7 @@ pub trait Driver: 'static + Send + Sized {
             })
             .collect::<Vec<_>>();
         std::mem::drop(counter); // 丢弃外面的引用，此后引用计数 === 存活的驱动数
-
-        // 收集正确打开的驱动
+                                 // 收集正确打开的驱动
         drivers
             .into_iter()
             .filter_map(|(t, o)| task::block_on(o).map(|b| (t, b)))
