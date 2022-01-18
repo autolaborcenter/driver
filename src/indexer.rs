@@ -118,7 +118,7 @@ where
         let tail = self.pinned.len() - 1;
         for i in (0..=tail).rev() {
             if let Some(ref item) = self.get(i) {
-                match self.cmp(&t, item) {
+                match self.cmp(t, item) {
                     Equal => {
                         return match self.waiting.pop() {
                             Some(t) => {
@@ -132,7 +132,7 @@ where
                         };
                     }
                     Less => {
-                        std::mem::replace(&mut self.waiting, Default::default())
+                        std::mem::take(&mut self.waiting)
                             .into_iter()
                             .filter(|it| t != it)
                             .for_each(|it| self.waiting.push(it));
@@ -142,13 +142,13 @@ where
                 }
             }
         }
-        return None;
+        None
     }
 
     pub fn find(&self, t: &T) -> Option<usize> {
         for i in (0..self.pinned.len()).rev() {
             if let Some(ref item) = self.get(i) {
-                match self.cmp(&t, item) {
+                match self.cmp(t, item) {
                     Less => return None,
                     Equal => return Some(i),
                     Greater => {}
@@ -164,17 +164,17 @@ where
     }
 
     #[inline]
-    fn get_mut<'a>(&'a mut self, i: usize) -> &'a mut Option<T> {
+    fn get_mut(&mut self, i: usize) -> &mut Option<T> {
         unsafe { self.pinned.get_unchecked_mut(i) }
     }
 
     #[inline]
-    fn get<'a>(&'a self, i: usize) -> &'a Option<T> {
+    fn get(&self, i: usize) -> &Option<T> {
         unsafe { self.pinned.get_unchecked(i) }
     }
 
     #[inline]
-    fn get_value<'a>(&'a self, i: usize) -> &'a T {
+    fn get_value(&self, i: usize) -> &T {
         self.get(i).as_ref().unwrap()
     }
 
@@ -202,7 +202,6 @@ where
 
     /// 将 t 填充到 i 并移动到找到一个空位
     /// 不知道空位在何处
-    #[inline]
     fn put_somewhere_forward(&mut self, i: usize, mut t: T) {
         t = std::mem::replace(self.get_mut(i).as_mut().unwrap(), t);
         unsafe { self.modified.clear(i) };
@@ -221,7 +220,6 @@ where
 
     /// 将空位以 t 填充并移动到范围另一端
     /// range 的开头（包括）是空位
-    #[inline]
     fn put_forward(&mut self, range: Range<usize>, t: T) {
         self.len += 1;
         *self.get_mut(range.start) = Some(t);
@@ -234,7 +232,6 @@ where
 
     /// 将空位以 t 填充并移动到范围另一端
     /// range 的末尾（不包括）是空位
-    #[inline]
     fn put_backward(&mut self, range: Range<usize>, t: T) {
         self.len += 1;
         *self.get_mut(range.end) = Some(t);
@@ -247,10 +244,12 @@ where
 }
 
 impl FlagVec {
+    #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self(vec![0; (capacity + 7) / 8])
     }
 
+    #[inline]
     unsafe fn set(&mut self, i: usize) {
         *self.0.get_unchecked_mut(i / 8) |= 1 << (i % 8);
     }
@@ -271,9 +270,9 @@ mod t {
     #[inline]
     fn vec_modified<T: Ord>(indexer: &Indexer<T>) -> Vec<bool> {
         let mut result = vec![false; indexer.pinned.len()];
-        for i in 0..indexer.pinned.len() {
+        for (i, item) in result.iter_mut().enumerate().take(indexer.pinned.len()) {
             if (indexer.modified.0[i / 8] & (1 << (i % 8))) != 0 {
-                result[i] = true;
+                *item = true;
             }
         }
         result
@@ -281,7 +280,7 @@ mod t {
 
     #[inline]
     fn vec_waiting<T: Ord + Copy>(indexer: &Indexer<T>) -> Vec<T> {
-        let mut x = indexer.waiting.iter().map(|r| *r).collect::<Vec<_>>();
+        let mut x = indexer.waiting.iter().copied().collect::<Vec<_>>();
         x.sort();
         x
     }

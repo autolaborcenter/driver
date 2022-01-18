@@ -59,7 +59,7 @@ impl<D: Driver> SupervisorForSingle<D> {
                 }
             }
             // 上下文中驱动已取出
-            match D::open_some(1).into_iter().next() {
+            match D::open_some(1).pop() {
                 // 成功打开驱动，保存
                 Some((t, driver)) => {
                     self.0 = Some(driver);

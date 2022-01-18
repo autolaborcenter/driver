@@ -6,15 +6,14 @@ use async_std::{
 };
 use std::{collections::HashMap, hash::Hash, sync::mpsc, time::Instant};
 
+type Handle<D> = (
+    mpsc::Sender<<D as MultipleDeviceDriver>::Command>,
+    JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>,
+);
+
 pub(super) struct JoinContextForMultiple<'a, D: MultipleDeviceDriver, F> {
     parent: &'a mut SupervisorForMultiple<D>,
-    handles: HashMap<
-        <D as Driver>::Key,
-        (
-            mpsc::Sender<D::Command>,
-            JoinHandle<Option<(<D as Driver>::Key, Box<D>)>>,
-        ),
-    >,
+    handles: HashMap<<D as Driver>::Key, Handle<D>>,
     sender: Sender<OutEvent<D>>,
     receiver: Receiver<OutEvent<D>>,
     target_len: usize,
@@ -34,7 +33,7 @@ where
         let (sender, receiver) = channel::unbounded();
 
         // 取出上下文中保存的驱动对象
-        let handles = std::mem::replace(&mut parent.0, Vec::new())
+        let handles = std::mem::take(&mut parent.0)
             .into_iter()
             .map(|(k, d)| (k.clone(), spawn(sender.clone(), k, d)))
             .collect::<HashMap<_, _>>();
@@ -146,10 +145,7 @@ fn spawn<D: MultipleDeviceDriver>(
     sender: Sender<OutEvent<D>>,
     k: D::Key,
     mut d: Box<D>,
-) -> (
-    mpsc::Sender<D::Command>,
-    JoinHandle<Option<(D::Key, Box<D>)>>,
-)
+) -> Handle<D>
 where
     D::Key: Send + Clone,
     D::Event: Send,
@@ -159,12 +155,13 @@ where
     (
         command_sender,
         task::spawn_blocking(move || {
-            if d.join(|d, event| {
+            let ok = d.join(|d, event| {
                 while let Ok(c) = command_receiver.try_recv() {
                     d.send(c);
                 }
                 block_on(sender.send(OutEvent::Event(k.clone(), event))).is_ok()
-            }) {
+            });
+            if ok {
                 Some((k, d))
             } else {
                 let _ = block_on(sender.send(OutEvent::Disconnected(k)));

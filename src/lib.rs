@@ -69,6 +69,7 @@ pub trait Driver: 'static + Send + Sized {
         };
         // 打开临时的监控以筛除不产生正确输出的设备
         let counter = Arc::new(()); // ---------------------- // 用一个 Arc 来计数
+        #[allow(clippy::needless_collect)]
         let drivers = drivers
             .into_iter()
             .map(|(t, mut d)| {
@@ -76,9 +77,10 @@ pub trait Driver: 'static + Send + Sized {
                 (
                     t,
                     task::spawn_blocking(move || {
-                        if d.join(|_, _| {
+                        let ok = d.join(|_, _| {
                             Arc::strong_count(&counter) > len && Instant::now() < deadline
-                        }) {
+                        });
+                        if ok {
                             Some(d)
                         } else {
                             None
@@ -109,10 +111,12 @@ pub trait DriverPacemaker {
 
 /// 空白起搏器，什么也不做，立即退出循环。
 impl DriverPacemaker for () {
+    #[inline]
     fn period() -> Duration {
         Duration::MAX
     }
 
+    #[inline]
     fn send(&mut self) -> bool {
         false
     }

@@ -5,6 +5,7 @@ mod context;
 
 pub trait MultipleDeviceDriver: Driver {
     type Command;
+
     fn send(&mut self, command: Self::Command);
 }
 
@@ -25,16 +26,25 @@ pub enum SupervisorEventForMultiple<'a, D: MultipleDeviceDriver> {
     Disconnected(D::Key),
 }
 
+impl<D: MultipleDeviceDriver> Default for SupervisorForMultiple<D> {
+    #[inline]
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
 impl<D: MultipleDeviceDriver> SupervisorForMultiple<D>
 where
     D::Key: Send + Clone + Eq + Hash,
     D::Event: Send,
     D::Command: Send,
 {
+    #[inline]
     pub fn new() -> Self {
-        Self(Vec::new())
+        Default::default()
     }
 
+    #[inline]
     pub fn join<F>(&mut self, init_len: usize, f: F)
     where
         F: FnMut(SupervisorEventForMultiple<D>) -> usize,
